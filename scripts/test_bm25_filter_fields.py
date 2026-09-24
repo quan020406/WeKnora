@@ -126,9 +126,10 @@ def check_writes(db):
     for enabled, expected in (("true", "1"), ("NULL", "1"), ("false", "0")):
         db.sql(f"""INSERT INTO embeddings(source_id,source_type,knowledge_base_id,
             content,dimension,is_enabled) VALUES
-            ('write-test',0,'write-kb','uniquewritetoken',1024,{enabled})""")
-        query = ("SELECT count(*) FROM embeddings WHERE content ||| 'uniquewritetoken' "
-                 "AND knowledge_base_id='write-kb' AND (is_enabled IS NULL OR is_enabled=true)")
+            ('write-test',0,'kb-0','uniquewritetoken',1024,{enabled})""")
+        query = indexed_filters(
+            "SELECT count(*) FROM embeddings WHERE content ||| 'uniquewritetoken' "
+            "AND knowledge_base_id = 'kb-0' AND (is_enabled IS NULL OR is_enabled = true)")
         assert db.sql(query) == expected, f"wrong enabled semantics for {enabled}"
         for state, count in (("false", "0"), ("NULL", "1"), ("true", "1")):
             db.sql(f"UPDATE embeddings SET is_enabled={state} WHERE source_id='write-test'")

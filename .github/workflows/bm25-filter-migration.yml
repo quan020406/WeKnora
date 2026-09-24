@@ -26,7 +26,9 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - run: go test ./internal/application/repository/retriever/postgres -count=1
+      - run: |
+          go test ./internal/application/repository/retriever/postgres -count=1
+          go test ./internal/database -run '^TestMigrationDirectoriesLoad$' -count=1
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'

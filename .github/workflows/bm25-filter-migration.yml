@@ -1,0 +1,32 @@
+name: BM25 filter migration
+
+on:
+  push:
+    paths:
+      - 'migrations/versioned/*bm25_filter_fields*'
+      - 'scripts/test_bm25_filter_fields.py'
+      - '.github/workflows/bm25-filter-migration.yml'
+  pull_request:
+    paths:
+      - 'migrations/versioned/*bm25_filter_fields*'
+      - 'scripts/test_bm25_filter_fields.py'
+      - '.github/workflows/bm25-filter-migration.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  paradedb:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python scripts/test_bm25_filter_fields.py --baseline --output-dir /tmp/bm25-evidence
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bm25-filter-evidence
+          path: /tmp/bm25-evidence

@@ -149,7 +149,12 @@ def run(db, output, baseline):
     (output / "after-plan.json").write_text(json.dumps(after, indent=2), encoding="utf-8")
     print("After: " + json.dumps(after), flush=True)
     require_pushdown(after)
-    assert [db.sql(q) for q in statements] == results, "result IDs, ordering or scores changed"
+    for query, expected in zip(statements, results):
+        actual = db.sql(query)
+        assert actual == expected, (
+            f"result IDs, ordering or scores changed: {query}\n"
+            f"Before: {expected[:1500]}\nAfter: {actual[:1500]}"
+        )
     assert fingerprint(db) == original_rows, "migration changed embedding rows"
     for query, expected in zip(statements, results):
         # Exercise production TopK ordering too. Equal-score ties may return

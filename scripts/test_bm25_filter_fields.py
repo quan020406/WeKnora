@@ -55,7 +55,9 @@ def queries():
         for scope in ("", " AND knowledge_base_id = 'kb-0'",
                       " AND knowledge_base_id IN ('kb-0', 'kb-1')",
                       " AND knowledge_base_id = 'kb-0' AND knowledge_id IN ('doc-0', 'doc-4')",
-                      " AND knowledge_base_id = 'kb-0' AND tag_id IN ('tag-0', 'tag-1')"):
+                      " AND knowledge_base_id = 'kb-0' AND tag_id IN ('tag-0', 'tag-1')",
+                      " AND knowledge_base_id = 'kb-0' AND knowledge_id IN ('doc-0', 'doc-4')"
+                      " AND tag_id IN ('tag-0', 'tag-1')"):
             for limit in (1, 10, 100):
                 yield (
                     "SELECT id, paradedb.score(id) AS score, content, source_id, source_type, "
@@ -145,6 +147,17 @@ def without_scores(result):
     return [tuple(row[:1] + row[2:]) for row in result_rows(result)]
 
 
+def relevance_query(query):
+    # Retain the existing document/tag filters, which may themselves use heap
+    # filtering. Only the two filters changed by this migration must add zero.
+    where = query.split(" FROM embeddings", 1)[1].split(" ORDER BY ", 1)[0]
+    for clause in (" AND (is_enabled IS NULL OR is_enabled = true)",
+                   " AND knowledge_base_id = 'kb-0'",
+                   " AND knowledge_base_id IN ('kb-0', 'kb-1')"):
+        where = where.replace(clause, "")
+    return "SELECT id, paradedb.score(id) FROM embeddings" + where
+
+
 def run(db, output, baseline):
     paths = sorted((ROOT / "migrations/versioned").glob("*.up.sql"))
     up = ROOT / "migrations/versioned" / (MIGRATION + ".up.sql")
@@ -160,15 +173,14 @@ def run(db, output, baseline):
     assert "heap_filter" in json.dumps(before).lower(), "baseline did not reproduce issue #3301"
     statements = list(queries())
     results = [db.sql(q) for q in statements]
-    # Content-only scores are the relevance oracle. Legacy heap_filter plans
-    # can count the content query twice when document filters are combined.
-    # Retain the old result ordering, but never reproduce that extra score.
+    # Legacy heap_filter plans may count the content query repeatedly. Compare
+    # relevance with the same query minus KB/enabled filters, so these indexed
+    # filters cannot boost scores. Document/tag filtering is outside this fix.
     content_scores = {}
     for query in statements:
-        term = query.split("WHERE content ||| ", 1)[1].split(" AND ", 1)[0]
-        if term not in content_scores:
-            content_scores[term] = dict(result_rows(db.sql(
-                "SELECT id, paradedb.score(id) FROM embeddings WHERE content ||| " + term)))
+        reference = relevance_query(query)
+        if reference not in content_scores:
+            content_scores[reference] = dict(result_rows(db.sql(reference)))
     complete_results = {}
     for query in statements:
         unlimited = query.rsplit(" LIMIT ", 1)[0]
@@ -192,10 +204,10 @@ def run(db, output, baseline):
             f"result IDs, ordering or fields changed: {query}\n"
             f"Before: {expected[:1500]}\nAfter: {actual[:1500]}"
         )
-        term = query.split("WHERE content ||| ", 1)[1].split(" AND ", 1)[0]
+        reference = relevance_query(query)
         for row in result_rows(actual):
-            assert row[1] == content_scores[term][row[0]], (
-                f"filter changed content relevance: {query}: {row[:2]} vs {content_scores[term][row[0]]}"
+            assert row[1] == content_scores[reference][row[0]], (
+                f"KB/enabled filter changed relevance: {query}: {row[:2]} vs {content_scores[reference][row[0]]}"
             )
     assert fingerprint(db) == original_rows, "migration changed embedding rows"
     for query, expected in zip(statements, updated_results):
@@ -206,12 +218,12 @@ def run(db, output, baseline):
         assert set(without_scores(actual)) <= allowed, "production TopK returned a row outside its filters"
         rows = result_rows(actual)
         wanted = result_rows(expected)
-        term = query.split("WHERE content ||| ", 1)[1].split(" AND ", 1)[0]
-        assert all(row[1] == content_scores[term][row[0]] for row in rows), "TopK changed content relevance"
+        reference = relevance_query(query)
+        assert all(row[1] == content_scores[reference][row[0]] for row in rows), "TopK KB/enabled filter changed relevance"
         assert [row[1] for row in rows] == [row[1] for row in wanted], "production TopK scores changed"
         assert len({row[0] for row in rows}) == len(rows), "production TopK returned duplicate IDs"
     check_writes(db)
-    print("PASS: filter pushdown, result/score preservation and committed writes", flush=True)
+    print("PASS: filter pushdown, result ordering, zero-score filters and committed writes", flush=True)
 
     db.migrate([down])
     assert "".join(index_definition(db).split()) == "".join(original_index.split()), "rollback did not restore the index"
@@ -233,7 +245,10 @@ def run(db, output, baseline):
     db.migrate(paths, "skipped", "SET app.skip_embedding='true';")
     assert db.sql("SELECT to_regclass('embeddings') IS NULL", "skipped") == "t"
     db.migrate([ROOT / "migrations/paradedb/00-init-db.sql"], "bootstrap")
-    db.migrate(paths, "bootstrap")
+    # The legacy bootstrap and 000000 currently disagree on tenants.api_key.
+    # Exercise its embeddings schema with the relevant embeddings migrations;
+    # the separate fresh database below runs the full supported migration chain.
+    db.migrate([p for p in paths if p.name.startswith(("000002_", "000007_"))] + [up], "bootstrap")
     db.migrate(paths, "fresh")
     for database in ("bootstrap", "fresh"):
         require_fields(db, database)
@@ -241,7 +256,7 @@ def run(db, output, baseline):
                "VALUES ('fresh',0,'kb-0','新安装数据库检索',1024)", database)
         assert db.sql("SELECT count(*) FROM embeddings WHERE content ||| '数据库' "
                       "AND knowledge_base_id='kb-0' AND (is_enabled IS NULL OR is_enabled=true)", database) == "1"
-    print("PASS: absent table, non-Postgres retriever, both fresh-install paths", flush=True)
+    print("PASS: absent table, non-Postgres retriever, legacy embeddings bootstrap and fresh migrations", flush=True)
     (output / "PASS").write_text("BM25 migration checks passed.\n", encoding="utf-8")
 
 

@@ -38,7 +38,12 @@ func TestKeywordsRetrieveFilterScores(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer conn.Close()
+			t.Cleanup(func() {
+				mock.ExpectClose()
+				if err := conn.Close(); err != nil {
+					t.Error(err)
+				}
+			})
 			db, err := gorm.Open(pgdriver.New(pgdriver.Config{Conn: conn}), &gorm.Config{})
 			if err != nil {
 				t.Fatal(err)

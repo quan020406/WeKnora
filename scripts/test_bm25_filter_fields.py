@@ -137,6 +137,14 @@ def check_writes(db):
         assert db.sql("SELECT count(*) FROM embeddings WHERE content ||| 'uniquewritetoken'") == "0"
 
 
+def result_rows(result):
+    return [line.split("|") for line in result.splitlines()]
+
+
+def without_scores(result):
+    return [tuple(row[:1] + row[2:]) for row in result_rows(result)]
+
+
 def run(db, output, baseline):
     paths = sorted((ROOT / "migrations/versioned").glob("*.up.sql"))
     up = ROOT / "migrations/versioned" / (MIGRATION + ".up.sql")
@@ -152,11 +160,20 @@ def run(db, output, baseline):
     assert "heap_filter" in json.dumps(before).lower(), "baseline did not reproduce issue #3301"
     statements = list(queries())
     results = [db.sql(q) for q in statements]
+    # Content-only scores are the relevance oracle. Legacy heap_filter plans
+    # can count the content query twice when document filters are combined.
+    # Retain the old result ordering, but never reproduce that extra score.
+    content_scores = {}
+    for query in statements:
+        term = query.split("WHERE content ||| ", 1)[1].split(" AND ", 1)[0]
+        if term not in content_scores:
+            content_scores[term] = dict(result_rows(db.sql(
+                "SELECT id, paradedb.score(id) FROM embeddings WHERE content ||| " + term)))
     complete_results = {}
     for query in statements:
         unlimited = query.rsplit(" LIMIT ", 1)[0]
         if unlimited not in complete_results:
-            complete_results[unlimited] = set(db.sql(unlimited).splitlines())
+            complete_results[unlimited] = set(without_scores(db.sql(unlimited)))
     print(f"Baseline: {len(results)} retrieval queries captured; heap_filter reproduced", flush=True)
     if baseline:
         require_pushdown(before)
@@ -169,21 +186,28 @@ def run(db, output, baseline):
     print("After: " + json.dumps(after), flush=True)
     require_pushdown(after)
     updated = [indexed_filters(q) for q in statements]
-    for query, expected in zip(updated, results):
-        actual = db.sql(query)
-        assert actual == expected, (
-            f"result IDs, ordering or scores changed: {query}\n"
+    updated_results = [db.sql(q) for q in updated]
+    for query, expected, actual in zip(statements, results, updated_results):
+        assert without_scores(actual) == without_scores(expected), (
+            f"result IDs, ordering or fields changed: {query}\n"
             f"Before: {expected[:1500]}\nAfter: {actual[:1500]}"
         )
+        term = query.split("WHERE content ||| ", 1)[1].split(" AND ", 1)[0]
+        for row in result_rows(actual):
+            assert row[1] == content_scores[term][row[0]], (
+                f"filter changed content relevance: {query}: {row[:2]} vs {content_scores[term][row[0]]}"
+            )
     assert fingerprint(db) == original_rows, "migration changed embedding rows"
-    for query, expected in zip(statements, results):
+    for query, expected in zip(statements, updated_results):
         # Exercise production TopK ordering too. Equal-score ties may return
         # different IDs, but the score sequence and number of rows must agree.
         actual = db.sql(indexed_filters(query).replace("ORDER BY score DESC, id", "ORDER BY score DESC"))
         allowed = complete_results[query.rsplit(" LIMIT ", 1)[0]]
-        assert set(actual.splitlines()) <= allowed, "production TopK returned a row outside its filters"
-        rows = [line.split("|") for line in actual.splitlines()]
-        wanted = [line.split("|") for line in expected.splitlines()]
+        assert set(without_scores(actual)) <= allowed, "production TopK returned a row outside its filters"
+        rows = result_rows(actual)
+        wanted = result_rows(expected)
+        term = query.split("WHERE content ||| ", 1)[1].split(" AND ", 1)[0]
+        assert all(row[1] == content_scores[term][row[0]] for row in rows), "TopK changed content relevance"
         assert [row[1] for row in rows] == [row[1] for row in wanted], "production TopK scores changed"
         assert len({row[0] for row in rows}) == len(rows), "production TopK returned duplicate IDs"
     check_writes(db)

@@ -17,13 +17,16 @@ func TestKeywordsRetrieveFilterScores(t *testing.T) {
 		t.Run(fmt.Sprintf("scoped=%t", scoped), func(t *testing.T) {
 			conn, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherFunc(
 				func(_, query string) error {
+					const enabled = "must => paradedb.all(), must_not => paradedb.term('is_enabled', false)"
+					const kbTerms = "paradedb.term('knowledge_base_id', $1::text), " +
+						"paradedb.term('knowledge_base_id', $2::text)"
 					// Both filters must match without contributing to relevance.
 					if !strings.Contains(query, "id @@@ paradedb.const_score(0, paradedb.boolean(") ||
-						!strings.Contains(query, "must => paradedb.all(), must_not => paradedb.term('is_enabled', false)") {
+						!strings.Contains(query, enabled) {
 						return fmt.Errorf("enabled filter can change BM25 scores: %s", query)
 					}
 					if scoped && (!strings.Contains(query, "id @@@ paradedb.const_score(0, paradedb.term_set(ARRAY[") ||
-						!strings.Contains(query, "paradedb.term('knowledge_base_id', $1::text), paradedb.term('knowledge_base_id', $2::text)")) {
+						!strings.Contains(query, kbTerms)) {
 						return fmt.Errorf("KB filter is not a parameterized zero-score term set: %s", query)
 					}
 					if strings.Contains(query, "kb-'quoted") || !strings.Contains(query, "content |||") ||

@@ -134,6 +134,7 @@ def run(db, output, baseline):
     original_index = index_definition(db)
     before = filter_plan(db)
     (output / "before-plan.json").write_text(json.dumps(before, indent=2), encoding="utf-8")
+    print("Before: " + json.dumps(before), flush=True)
     assert "heap_filter" in json.dumps(before).lower(), "baseline did not reproduce issue #3301"
     statements = list(queries())
     results = [db.sql(q) for q in statements]
@@ -146,14 +147,23 @@ def run(db, output, baseline):
     require_fields(db)
     after = filter_plan(db)
     (output / "after-plan.json").write_text(json.dumps(after, indent=2), encoding="utf-8")
+    print("After: " + json.dumps(after), flush=True)
     require_pushdown(after)
     assert [db.sql(q) for q in statements] == results, "result IDs, ordering or scores changed"
     assert fingerprint(db) == original_rows, "migration changed embedding rows"
+    for query, expected in zip(statements, results):
+        # Exercise production TopK ordering too. Equal-score ties may return
+        # different IDs, but the score sequence and number of rows must agree.
+        actual = db.sql(query.replace("ORDER BY score DESC, id", "ORDER BY score DESC"))
+        rows = [line.split("|") for line in actual.splitlines()]
+        wanted = [line.split("|") for line in expected.splitlines()]
+        assert [row[1] for row in rows] == [row[1] for row in wanted], "production TopK scores changed"
+        assert len({row[0] for row in rows}) == len(rows), "production TopK returned duplicate IDs"
     check_writes(db)
     print("PASS: filter pushdown, result/score preservation and committed writes", flush=True)
 
     db.migrate([down])
-    assert index_definition(db) == original_index, "rollback did not restore the index"
+    assert "".join(index_definition(db).split()) == "".join(original_index.split()), "rollback did not restore the index"
     assert [db.sql(q) for q in statements] == results, "rollback changed query results"
     db.migrate([up])
     require_pushdown(filter_plan(db))

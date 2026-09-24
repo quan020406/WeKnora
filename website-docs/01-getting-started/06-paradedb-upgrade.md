@@ -64,3 +64,27 @@ python3 scripts/test_paradedb_upgrade.py
 ```
 
 脚本使用临时容器和卷，不映射端口；验证同一数据卷升级、表内容、关键词/向量检索、迁移幂等性和重启后结果，并输出备份与日志。该用例验证固定测试数据，部署时仍需检查自己的数据和检索负载。
+
+## BM25 过滤字段索引迁移（000111）
+
+`000111_bm25_filter_fields` 为关键词检索重建 `embeddings_search_idx`：
+
+- 将 `knowledge_base_id` 配置为 `keyword` tokenizer 和 fast field，使知识库 ID 的等值/IN 过滤能够在 BM25 索引中执行。
+- 将 `is_enabled` 加入索引并配置为 boolean fast field，保留 `true` 或 `NULL` 表示启用的查询语义。
+- 保留 `content` 的 `chinese_lindera` tokenizer；不修改 embedding 数据、向量索引或检索 API。
+
+关键词查询同时用 `paradedb.const_score(0, ...)` 表达这两个过滤条件。仅新增索引而保留原 SQL，会让过滤条件参与 BM25 评分；零分过滤保留内容相关性排序，并通过排除 `false` 保留历史 `NULL` 数据。应用查询与这条 migration 需要一起部署；回滚数据库时也应恢复对应的旧应用版本。
+
+与上面的扩展补丁升级不同，这条迁移会重建 BM25 索引。重建期间会持有表锁，阻塞 `embeddings` 的读写；大库应安排维护窗口，预留索引重建时间与磁盘空间。迁移在单个原子 SQL 语句内替换索引；创建失败时旧索引会恢复，仍需按现有迁移流程处理失败状态后再启动应用。
+
+标准初始化和仅版本化迁移的安装路径均通过这条迁移收敛到相同索引。设置了 `app.skip_embedding=true`，或不存在 `embeddings` 表时会跳过。down 迁移恢复原来的字段和 tokenizer 配置，也需要重建索引并持锁；它不回滚扩展版本。
+
+使用 Python 3 和 Docker 运行隔离回归验证：
+
+```bash
+python3 scripts/test_bm25_filter_fields.py
+# 在迁移前索引上重现 heap_filter，预期以断言失败退出：
+python3 scripts/test_bm25_filter_fields.py --baseline
+```
+
+脚本使用临时 ParadeDB 0.22.6 / PostgreSQL 17 容器，不映射端口，不挂载现有数据卷，并在结束时删除自己创建的容器和匿名卷。执行计划与数据库日志保存在输出目录；可通过 `--output-dir` 指定一个空目录。验证覆盖过滤下推、检索结果、启用状态更新、回滚/重应用、跳过 embedding 和两条新安装路径。固定测试数据的执行时间不能代表生产性能收益。

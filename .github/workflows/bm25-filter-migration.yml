@@ -5,11 +5,13 @@ on:
     paths:
       - 'migrations/versioned/*bm25_filter_fields*'
       - 'scripts/test_bm25_filter_fields.py'
+      - 'internal/application/repository/retriever/postgres/**'
       - '.github/workflows/bm25-filter-migration.yml'
   pull_request:
     paths:
       - 'migrations/versioned/*bm25_filter_fields*'
       - 'scripts/test_bm25_filter_fields.py'
+      - 'internal/application/repository/retriever/postgres/**'
       - '.github/workflows/bm25-filter-migration.yml'
 
 permissions:
@@ -21,6 +23,10 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go test ./internal/application/repository/retriever/postgres -count=1
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'

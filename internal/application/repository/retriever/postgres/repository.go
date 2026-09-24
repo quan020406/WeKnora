@@ -173,9 +173,15 @@ func (g *pgRepository) KeywordsRetrieve(ctx context.Context,
 	// - If both: search specific documents within the knowledge bases (AND)
 	if len(params.KnowledgeBaseIDs) > 0 {
 		logger.GetLogger(ctx).Debugf("[Postgres] Filtering by knowledge base IDs: %v", params.KnowledgeBaseIDs)
-		conds = append(conds, clause.IN{
-			Column: "knowledge_base_id",
-			Values: common.ToInterfaceSlice(params.KnowledgeBaseIDs),
+		// Indexed scope filters must not add relevance to the content score.
+		terms := make([]string, len(params.KnowledgeBaseIDs))
+		for i := range terms {
+			terms[i] = "paradedb.term('knowledge_base_id', ?::text)"
+		}
+		conds = append(conds, clause.Expr{
+			SQL: "id @@@ paradedb.const_score(0, paradedb.term_set(ARRAY[" +
+				strings.Join(terms, ", ") + "]))",
+			Vars: common.ToInterfaceSlice(params.KnowledgeBaseIDs),
 		})
 	}
 	if len(params.KnowledgeIDs) > 0 {
@@ -200,10 +206,11 @@ func (g *pgRepository) KeywordsRetrieve(ctx context.Context,
 		Vars: []interface{}{params.Query},
 	})
 
-	// Filter by is_enabled = true or NULL (NULL means enabled for historical data)
+	// Exclude only false: historical NULL values remain enabled. A zero-score
+	// query prevents the indexed boolean filter from changing content ranking.
 	conds = append(conds, clause.Expr{
-		SQL:  "(is_enabled IS NULL OR is_enabled = ?)",
-		Vars: []interface{}{true},
+		SQL: "id @@@ paradedb.const_score(0, paradedb.boolean(" +
+			"must => paradedb.all(), must_not => paradedb.term('is_enabled', false)))",
 	})
 	conds = append(conds, clause.OrderBy{Columns: []clause.OrderByColumn{
 		{Column: clause.Column{Name: "score"}, Desc: true},

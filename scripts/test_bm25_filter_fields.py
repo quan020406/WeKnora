@@ -35,6 +35,19 @@ class Database:
             self.sql(settings + "\n" + path.read_text(encoding="utf-8"), database)
 
 
+ENABLED_FILTER = ("id @@@ paradedb.const_score(0, paradedb.boolean("
+                  "must => paradedb.all(), must_not => paradedb.term('is_enabled', false)))")
+
+
+def indexed_filters(query):
+    # Mirror the parameterized filter expressions in KeywordsRetrieve.
+    for clause, values in (("knowledge_base_id = 'kb-0'", ("kb-0",)),
+                           ("knowledge_base_id IN ('kb-0', 'kb-1')", ("kb-0", "kb-1"))):
+        terms = ", ".join(f"paradedb.term('knowledge_base_id', '{v}'::text)" for v in values)
+        query = query.replace(clause, f"id @@@ paradedb.const_score(0, paradedb.term_set(ARRAY[{terms}]))")
+    return query.replace("(is_enabled IS NULL OR is_enabled = true)", ENABLED_FILTER)
+
+
 def queries():
     # Same projection, ||| operator, filters and score ordering as KeywordsRetrieve.
     # ID is only a deterministic tie-breaker for comparing equal-score results.
@@ -73,8 +86,8 @@ def index_definition(db, database="weknora"):
     return db.sql("SELECT pg_get_indexdef('embeddings_search_idx'::regclass)", database)
 
 
-def filter_plan(db, database="weknora"):
-    return json.loads(db.sql("""
+def filter_plan(db, indexed=False):
+    query = """
         EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
         SELECT id, paradedb.score(id) AS score, content, source_id, source_type,
             chunk_id, knowledge_id, knowledge_base_id, tag_id
@@ -82,7 +95,8 @@ def filter_plan(db, database="weknora"):
         WHERE content ||| 'database' AND knowledge_base_id IN ('kb-0', 'kb-1')
             AND (is_enabled IS NULL OR is_enabled = true)
         ORDER BY score DESC LIMIT 10
-    """, database))
+    """
+    return json.loads(db.sql(indexed_filters(query) if indexed else query))
 
 
 def require_pushdown(plan):
@@ -138,6 +152,11 @@ def run(db, output, baseline):
     assert "heap_filter" in json.dumps(before).lower(), "baseline did not reproduce issue #3301"
     statements = list(queries())
     results = [db.sql(q) for q in statements]
+    complete_results = {}
+    for query in statements:
+        unlimited = query.rsplit(" LIMIT ", 1)[0]
+        if unlimited not in complete_results:
+            complete_results[unlimited] = set(db.sql(unlimited).splitlines())
     print(f"Baseline: {len(results)} retrieval queries captured; heap_filter reproduced", flush=True)
     if baseline:
         require_pushdown(before)
@@ -145,11 +164,12 @@ def run(db, output, baseline):
 
     db.migrate([up])
     require_fields(db)
-    after = filter_plan(db)
+    after = filter_plan(db, indexed=True)
     (output / "after-plan.json").write_text(json.dumps(after, indent=2), encoding="utf-8")
     print("After: " + json.dumps(after), flush=True)
     require_pushdown(after)
-    for query, expected in zip(statements, results):
+    updated = [indexed_filters(q) for q in statements]
+    for query, expected in zip(updated, results):
         actual = db.sql(query)
         assert actual == expected, (
             f"result IDs, ordering or scores changed: {query}\n"
@@ -159,7 +179,9 @@ def run(db, output, baseline):
     for query, expected in zip(statements, results):
         # Exercise production TopK ordering too. Equal-score ties may return
         # different IDs, but the score sequence and number of rows must agree.
-        actual = db.sql(query.replace("ORDER BY score DESC, id", "ORDER BY score DESC"))
+        actual = db.sql(indexed_filters(query).replace("ORDER BY score DESC, id", "ORDER BY score DESC"))
+        allowed = complete_results[query.rsplit(" LIMIT ", 1)[0]]
+        assert set(actual.splitlines()) <= allowed, "production TopK returned a row outside its filters"
         rows = [line.split("|") for line in actual.splitlines()]
         wanted = [line.split("|") for line in expected.splitlines()]
         assert [row[1] for row in rows] == [row[1] for row in wanted], "production TopK scores changed"
@@ -171,7 +193,7 @@ def run(db, output, baseline):
     assert "".join(index_definition(db).split()) == "".join(original_index.split()), "rollback did not restore the index"
     assert [db.sql(q) for q in statements] == results, "rollback changed query results"
     db.migrate([up])
-    require_pushdown(filter_plan(db))
+    require_pushdown(filter_plan(db, indexed=True))
     upgraded_index = index_definition(db)
     index_oid = db.sql("SELECT 'embeddings_search_idx'::regclass::oid")
     for path in (down, up):
